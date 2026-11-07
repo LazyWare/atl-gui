@@ -2,6 +2,7 @@ import gi
 import os
 import subprocess
 import shlex
+import time
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, GLib
@@ -589,10 +590,18 @@ def start_test(self, apk_path):
         command_summary += f"----------------------------------------\n"
         command_summary += f"Full command: {display_command}\n\n"
         
+        # With --log-dir, each run also writes its output to a file of its own
+        log_file = None
+        log_dir = os.environ.get('ATL_GUI_LOG_DIR')
+        if log_dir:
+            timestamp = time.strftime('%Y%m%d-%H%M%S')
+            log_file = os.path.join(log_dir, f"{timestamp}_{os.path.basename(apk_path)}.log")
+            command_summary += f"Log file: {log_file}\n\n"
+        
         buffer.set_text(command_summary)
         
         # Execute command in separate process
-        self.terminal_manager.execute_command(command, shell=True, env_vars=env_vars)
+        self.terminal_manager.execute_command(command, shell=True, env_vars=env_vars, log_file=log_file)
         
         # Set up GLib timeout to check for output from terminal module
         GLib.timeout_add(100, self.process_terminal_output)

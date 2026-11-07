@@ -186,6 +186,12 @@ def parse_args():
     )
     
     parser.add_argument(
+        "--log-dir",
+        metavar="DIR",
+        help="Write the output of each application run to a file in DIR"
+    )
+    
+    parser.add_argument(
         "--allow-multiple-instances",
         action="store_true",
         help="Allow multiple instances of the application to run simultaneously"
@@ -272,6 +278,10 @@ from src.app import main
 
 if __name__ == "__main__":
     args = parse_args()
+    
+    # Read by the test handlers when a run starts
+    if args.log_dir:
+        os.environ['ATL_GUI_LOG_DIR'] = os.path.abspath(args.log_dir)
     
     # Check if we should enforce singleton behavior
     if not args.allow_multiple_instances:

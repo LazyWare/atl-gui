@@ -33,6 +33,8 @@ class TerminalProcess(multiprocessing.Process):
         self.current_process = None
         self.reader_threads = []
         self.pending_command = None
+        self.log_handle = None
+        self.log_lock = None
         self.daemon = True  # Allow the process to exit when the main program exits
         print(f"[DEBUG] TerminalProcess initialized with PID: {os.getpid()}")
     
@@ -52,7 +54,8 @@ class TerminalProcess(multiprocessing.Process):
                         self._execute_command(
                             command["command"],
                             command["shell"],
-                            command["env_vars"]
+                            command["env_vars"],
+                            command.get("log_file")
                         )
                     elif command["action"] == "terminate":
                         self._terminate_process()
@@ -87,7 +90,7 @@ class TerminalProcess(multiprocessing.Process):
             except:
                 pass
     
-    def _execute_command(self, command, shell=True, env_vars=None):
+    def _execute_command(self, command, shell=True, env_vars=None, log_file=None):
         """
         Execute a command and stream output back to the main process.
         
@@ -95,9 +98,11 @@ class TerminalProcess(multiprocessing.Process):
             command: Command string to execute
             shell: Whether to use shell=True
             env_vars: Environment variables dictionary
+            log_file: Optional path of a file that receives the output as it arrives
         """
         # Terminate any existing process first
         self._terminate_process()
+        self._open_log(log_file)
         
         try:
             # Prepare environment variables
@@ -151,6 +156,7 @@ class TerminalProcess(multiprocessing.Process):
             
             # Process any remaining output
             self._join_readers()
+            self._close_log()
             
             # Send exit code
             exit_code = self.current_process.returncode
@@ -165,6 +171,7 @@ class TerminalProcess(multiprocessing.Process):
             self.current_process = None
             
         except Exception as e:
+            self._close_log()
             error_msg = f"Error executing command: {str(e)}"
             print(f"[DEBUG] {error_msg}")
             self.output_queue.put({
@@ -176,6 +183,7 @@ class TerminalProcess(multiprocessing.Process):
         """Forward each line of a stream to the main process until EOF."""
         try:
             for line in stream:
+                self._write_log(line)
                 self.output_queue.put({
                     "status": "output",
                     "stream": name,
@@ -184,6 +192,43 @@ class TerminalProcess(multiprocessing.Process):
         except ValueError:
             # The stream was closed by _terminate_process
             pass
+    
+    def _open_log(self, log_file):
+        """Open the log file; a failure is reported but does not stop the run."""
+        if not log_file:
+            return
+        try:
+            os.makedirs(os.path.dirname(log_file), exist_ok=True)
+            self.log_handle = open(log_file, "a", buffering=1, encoding="utf-8", errors="replace")
+            # Created here because the process object must stay picklable
+            self.log_lock = threading.Lock()
+        except OSError as e:
+            self.output_queue.put({
+                "status": "output",
+                "stream": "stderr",
+                "message": f"[SYSTEM] Cannot write log file {log_file}: {e}\n"
+            })
+    
+    def _write_log(self, line):
+        """Append one line to the log file, if there is one."""
+        if self.log_handle is None:
+            return
+        with self.log_lock:
+            if self.log_handle is not None:
+                try:
+                    self.log_handle.write(line)
+                except OSError:
+                    # Keep the run going, the output still reaches the GUI
+                    self.log_handle.close()
+                    self.log_handle = None
+    
+    def _close_log(self):
+        """Close the log file, if there is one."""
+        if self.log_handle is None:
+            return
+        with self.log_lock:
+            self.log_handle.close()
+            self.log_handle = None
     
     def _join_readers(self, timeout=2):
         """Wait for the reader threads; a surviving child may keep a pipe open."""
@@ -241,6 +286,7 @@ class TerminalProcess(multiprocessing.Process):
                     
                 # Ensure stdout/stderr are closed to prevent hanging
                 self._join_readers(timeout=1)
+                self._close_log()
                 try:
                     if self.reader_threads:
                         # Leave the streams open while a reader thread still uses them
@@ -343,7 +389,7 @@ class TerminalManager:
             return True
         return False
     
-    def execute_command(self, command, shell=True, env_vars=None):
+    def execute_command(self, command, shell=True, env_vars=None, log_file=None):
         """
         Execute a command in the terminal process.
         
@@ -351,6 +397,7 @@ class TerminalManager:
             command: Command string to execute
             shell: Whether to use shell=True
             env_vars: Environment variables dictionary
+            log_file: Optional path of a file that receives the output
         
         Returns:
             bool: True if command was sent, False if terminal process isn't running
@@ -362,7 +409,8 @@ class TerminalManager:
                     "action": "execute",
                     "command": command,
                     "shell": shell,
-                    "env_vars": env_vars
+                    "env_vars": env_vars,
+                    "log_file": log_file
                 })
                 return True
             except Exception as e:

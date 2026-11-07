@@ -47,7 +47,7 @@ sudo dnf install python3-gobject gtk4 libadwaita python3-pip
 ### Run from Source
 
 ```bash
-git clone https://github.com/os-guy/atl-gui.git
+git clone https://github.com/LazyWare/atl-gui.git
 cd atl-gui
 python3 atl_gui.py
 ```
@@ -92,7 +92,22 @@ cd appimage-build
 
 # Show display environment info
 ./atl_gui.py --show-backend
+
+# Save the output of each run to a file
+./atl_gui.py --log-dir ~/atl-logs
 ```
+
+With `--log-dir`, each application run writes its output (stdout and stderr, in order of arrival) to `<date-time>_<apk name>.log` in the given directory. The directory is created if missing, and the file is written line by line while the application runs.
+
+## Changes in this fork
+
+This is a fork of [os-guy/atl-gui](https://github.com/os-guy/atl-gui), which is archived.
+
+- Application output is read from stdout and stderr independently, so logs keep updating while an application runs.
+- Terminating a run now closes the application and its child processes (tested at module level, not yet from the Stop button).
+- New `--log-dir` option, see [Command Line Options](#command-line-options).
+
+The automatic success/failure detection is a score based on log patterns and can be wrong: check the application yourself before rating it.
 
 ## License
 
