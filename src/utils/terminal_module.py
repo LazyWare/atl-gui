@@ -1,6 +1,7 @@
 import subprocess
 import multiprocessing
 import queue
+import threading
 import time
 import os
 import signal
@@ -30,6 +31,8 @@ class TerminalProcess(multiprocessing.Process):
         self.output_queue = output_queue
         self.exit_event = exit_event
         self.current_process = None
+        self.reader_threads = []
+        self.pending_command = None
         self.daemon = True  # Allow the process to exit when the main program exits
         print(f"[DEBUG] TerminalProcess initialized with PID: {os.getpid()}")
     
@@ -40,7 +43,9 @@ class TerminalProcess(multiprocessing.Process):
             while not self.exit_event.is_set():
                 try:
                     # Check for new commands with a timeout to allow checking the exit event
-                    command = self.command_queue.get(timeout=0.1)
+                    # A command received while another one was running goes first
+                    command = self.pending_command or self.command_queue.get(timeout=0.1)
+                    self.pending_command = None
                     print(f"[DEBUG] Terminal process received command: {command['action']}")
                     
                     if command["action"] == "execute":
@@ -109,6 +114,8 @@ class TerminalProcess(multiprocessing.Process):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                errors="replace",
+                start_new_session=True,
                 env=env
             )
             
@@ -118,49 +125,32 @@ class TerminalProcess(multiprocessing.Process):
                 "message": f"Command started: {command}"
             })
             
-            # Process stdout and stderr
+            # Read each stream in its own thread: a stream that stays silent
+            # must not delay the other one or fill its pipe
+            self.reader_threads = [
+                threading.Thread(target=self._read_stream, args=(stream, name), daemon=True)
+                for stream, name in (
+                    (self.current_process.stdout, "stdout"),
+                    (self.current_process.stderr, "stderr"),
+                )
+            ]
+            for thread in self.reader_threads:
+                thread.start()
+            
             while self.current_process.poll() is None:
                 # Check if we should exit
                 if self.exit_event.is_set():
                     self._terminate_process()
                     return
                 
-                # Read stdout
-                stdout_line = self.current_process.stdout.readline()
-                if stdout_line:
-                    self.output_queue.put({
-                        "status": "output",
-                        "stream": "stdout",
-                        "message": stdout_line
-                    })
+                # Serve the command queue, run() cannot do it while we are here
+                if self._handle_running_commands():
+                    return
                 
-                # Read stderr
-                stderr_line = self.current_process.stderr.readline()
-                if stderr_line:
-                    self.output_queue.put({
-                        "status": "output",
-                        "stream": "stderr",
-                        "message": stderr_line
-                    })
-                
-                # Small sleep to prevent tight loop
-                if not stdout_line and not stderr_line:
-                    time.sleep(0.01)
+                time.sleep(0.05)
             
             # Process any remaining output
-            for line in self.current_process.stdout:
-                self.output_queue.put({
-                    "status": "output",
-                    "stream": "stdout",
-                    "message": line
-                })
-            
-            for line in self.current_process.stderr:
-                self.output_queue.put({
-                    "status": "output",
-                    "stream": "stderr",
-                    "message": line
-                })
+            self._join_readers()
             
             # Send exit code
             exit_code = self.current_process.returncode
@@ -182,6 +172,48 @@ class TerminalProcess(multiprocessing.Process):
                 "message": error_msg
             })
     
+    def _read_stream(self, stream, name):
+        """Forward each line of a stream to the main process until EOF."""
+        try:
+            for line in stream:
+                self.output_queue.put({
+                    "status": "output",
+                    "stream": name,
+                    "message": line
+                })
+        except ValueError:
+            # The stream was closed by _terminate_process
+            pass
+    
+    def _join_readers(self, timeout=2):
+        """Wait for the reader threads; a surviving child may keep a pipe open."""
+        for thread in self.reader_threads:
+            thread.join(timeout)
+        self.reader_threads = [t for t in self.reader_threads if t.is_alive()]
+    
+    def _handle_running_commands(self):
+        """
+        Handle queued commands while a process is running.
+        
+        Returns:
+            bool: True if the running process was terminated
+        """
+        try:
+            command = self.command_queue.get_nowait()
+        except queue.Empty:
+            return False
+        
+        if command["action"] == "ping":
+            self.output_queue.put({"status": "alive", "message": "Terminal process is running"})
+            return False
+        
+        if command["action"] == "exit":
+            self.exit_event.set()
+        elif command["action"] == "execute":
+            self.pending_command = command
+        self._terminate_process()
+        return True
+    
     def _terminate_process(self):
         """Immediately terminate the current process if it exists."""
         if self.current_process:
@@ -191,8 +223,9 @@ class TerminalProcess(multiprocessing.Process):
                 
                 # Skip graceful termination and use SIGKILL immediately for instant termination
                 try:
-                    # Send SIGKILL for immediate termination
-                    os.kill(process_pid, signal.SIGKILL)
+                    # Send SIGKILL to the whole session: with shell=True the PID may
+                    # be a shell whose child is the real application
+                    os.killpg(process_pid, signal.SIGKILL)
                     print(f"[DEBUG] SIGKILL sent to process {process_pid}")
                     
                     # Brief wait to confirm termination
@@ -207,7 +240,11 @@ class TerminalProcess(multiprocessing.Process):
                     self.current_process.kill()
                     
                 # Ensure stdout/stderr are closed to prevent hanging
+                self._join_readers(timeout=1)
                 try:
+                    if self.reader_threads:
+                        # Leave the streams open while a reader thread still uses them
+                        raise RuntimeError("reader threads still running")
                     if hasattr(self.current_process, 'stdout') and self.current_process.stdout:
                         self.current_process.stdout.close()
                     if hasattr(self.current_process, 'stderr') and self.current_process.stderr:
